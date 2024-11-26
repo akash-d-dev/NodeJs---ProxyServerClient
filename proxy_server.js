@@ -362,7 +362,7 @@ const tcpServer = net.createServer((socket) => {
 });
 
 // Start TCP server
-const TCP_PORT = PORT + 1;
+const TCP_PORT = Number(PORT) + 1;
 tcpServer.listen(TCP_PORT, () => {
   console.log(`TCP server running on port ${TCP_PORT}`);
 });

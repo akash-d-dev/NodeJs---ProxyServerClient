@@ -193,17 +193,37 @@ function sendErrorResponse(res, statusCode, isTcp = false) {
 }
 
 function checkHTTPVersion(version) {
-  return version === "HTTP/1.0" || version === "HTTP/1.1";
+  return version === "1.0" || version === "1.1";
+}
+
+function sanitizeUrl(requestUrl) {
+  // Check if the URL has multiple protocol parts
+  if (
+    requestUrl.startsWith("http://http://") ||
+    requestUrl.startsWith("https://https://")
+  ) {
+    // Fix the URL to have only one protocol
+    requestUrl = requestUrl.replace(/^(http:\/\/|https:\/\/)+/, "$1");
+  }
+  return requestUrl;
 }
 
 async function handleRequest(req, res) {
   try {
     await semaphore.acquire();
 
+    // Log the incoming URL request
+    console.log(`Received HTTP request for: ${req.url}`);
+
+    // Sanitize URL before processing
+    const sanitizedUrl = sanitizeUrl(req.url);
+    const requestUrl = url.parse(sanitizedUrl);
+
     let totalSize = 0;
     req.on("data", (chunk) => {
       totalSize += chunk.length;
       if (totalSize > MAX_BYTES) {
+        console.log("Request Entity Too Large", totalSize);
         sendErrorResponse(res, 400);
         req.destroy();
         return;
@@ -211,16 +231,23 @@ async function handleRequest(req, res) {
     });
 
     if (req.method !== "GET") {
+      console.log("Method Not Implemented", req.method);
       sendErrorResponse(res, 501);
       return;
     }
 
     if (!checkHTTPVersion(req.httpVersion)) {
+      console.log("HTTP Version Not Supported", req.httpVersion);
       sendErrorResponse(res, 505);
       return;
     }
 
-    const requestUrl = url.parse(req.url);
+    // Check if the URL is valid
+    if (!requestUrl.hostname || !requestUrl.protocol) {
+      console.log("Invalid URL format");
+      sendErrorResponse(res, 400); // Bad Request for invalid URL
+      return;
+    }
 
     // Check cache
     await cacheMutex.lock();
@@ -228,7 +255,7 @@ async function handleRequest(req, res) {
     cacheMutex.unlock();
 
     if (cachedResponse) {
-      console.log("Cache hit");
+      console.log("Cache hit for:", req.url);
       res.writeHead(200, {
         "Content-Type": "text/html",
         Connection: "close",
@@ -237,6 +264,7 @@ async function handleRequest(req, res) {
       return;
     }
 
+    // Forward request to remote server
     const options = {
       hostname: requestUrl.hostname,
       port: requestUrl.port || 80,
@@ -256,6 +284,7 @@ async function handleRequest(req, res) {
       });
 
       proxyResponse.on("end", async () => {
+        // Cache the response
         await cacheMutex.lock();
         cache.add(req.url, responseData, responseData.length);
         cacheMutex.unlock();
@@ -278,6 +307,110 @@ async function handleRequest(req, res) {
     semaphore.release();
   }
 }
+
+// async function handleRequest(req, res) {
+//   try {
+//     await semaphore.acquire();
+
+//     // Log the incoming URL request
+//     console.log(`Received HTTP request for: ${req.url}`);
+
+//     // Sanitize URL before processing
+//     const sanitizedUrl = sanitizeUrl(req.url);
+//     const requestUrl = url.parse(sanitizedUrl);
+
+//     let totalSize = 0;
+//     req.on("data", (chunk) => {
+//       totalSize += chunk.length;
+//       if (totalSize > MAX_BYTES) {
+//         console.log("Request Entity Too Large");
+//         sendErrorResponse(res, 400);
+//         req.destroy();
+//         return;
+//       }
+//     });
+
+//     if (req.method !== "GET") {
+//       console.log("Method Not Implemented");
+//       sendErrorResponse(res, 501);
+//       return;
+//     }
+
+//     if (!checkHTTPVersion(req.httpVersion)) {
+//       console.log("HTTP Version Not Supported");
+//       sendErrorResponse(res, 505);
+//       return;
+//     }
+
+//     // Check if the URL is valid
+//     if (!requestUrl.hostname || !requestUrl.protocol) {
+//       console.log("Invalid URL format");
+//       sendErrorResponse(res, 400); // Bad Request for invalid URL
+//       return;
+//     }
+
+//     // Check cache
+//     await cacheMutex.lock();
+//     const cachedResponse = cache.find(req.url);
+//     cacheMutex.unlock();
+
+//     if (cachedResponse) {
+//       console.log("Cache hit for:", req.url);
+//       res.writeHead(200, {
+//         "Content-Type": cachedResponse.contentType,
+//         Connection: "close",
+//       });
+//       res.end(cachedResponse.data);
+//       return;
+//     }
+
+//     // Forward request to remote server
+//     const options = {
+//       hostname: requestUrl.hostname,
+//       port: requestUrl.port || 80,
+//       path: requestUrl.path,
+//       method: "GET",
+//       headers: {
+//         ...req.headers,
+//         Connection: "close",
+//       },
+//     };
+
+//     const proxyRequest = http.request(options, async (proxyResponse) => {
+//       let responseData = Buffer.from("");
+//       const contentType = proxyResponse.headers["content-type"] || "text/html";
+
+//       // Cache the response if it's not an image or binary
+//       proxyResponse.on("data", (chunk) => {
+//         responseData = Buffer.concat([responseData, chunk]);
+//       });
+
+//       proxyResponse.on("end", async () => {
+//         // Cache the response if the content type is suitable
+//         if (contentType.startsWith("text/") || contentType === "application/json") {
+//           await cacheMutex.lock();
+//           cache.add(req.url, responseData, responseData.length, contentType);
+//           cacheMutex.unlock();
+//         }
+
+//         res.writeHead(proxyResponse.statusCode, proxyResponse.headers);
+//         res.end(responseData);
+//       });
+//     });
+
+//     proxyRequest.on("error", (err) => {
+//       console.error("Proxy Request Error:", err);
+//       sendErrorResponse(res, 500);
+//     });
+
+//     proxyRequest.end();
+//   } catch (error) {
+//     console.error("Request Handler Error:", error);
+//     sendErrorResponse(res, 500);
+//   } finally {
+//     semaphore.release();
+//   }
+// }
 
 // HTTP Server
 const server = http.createServer(async (req, res) => {
@@ -304,7 +437,6 @@ const tcpServer = net.createServer((socket) => {
       return;
     }
 
-    // Look for the end of the HTTP request headers
     if (buffer.includes("\r\n\r\n")) {
       const request = buffer.toString();
       const [requestLine] = request.split("\r\n");
@@ -320,6 +452,9 @@ const tcpServer = net.createServer((socket) => {
         socket.destroy();
         return;
       }
+
+      // Log the request
+      console.log(`Received TCP request for: ${path}`);
 
       // Forward the complete request to the HTTP server
       const options = {

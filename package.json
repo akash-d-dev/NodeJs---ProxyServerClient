@@ -1,0 +1,12 @@
+{
+  "name": "nodejs---proxyserverclient",
+  "version": "1.0.0",
+  "description": "Usage: node proxy_server.js [port_number]",
+  "main": "proxy_server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

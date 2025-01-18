@@ -1,83 +1,131 @@
-const http = require("http");
-const net = require("net");
-const url = require("url");
+const http = require('http');
+const net = require('net');
+const url = require('url');
+const { performance } = require('perf_hooks');
+const EventEmitter = require('events');
 
 // Constants
-const MAX_BYTES = 4096;
-const MAX_CLIENTS = 400;
-const MAX_CACHE_SIZE = 200 * (1 << 20);
-const MAX_ELEMENT_SIZE = 10 * (1 << 20);
+const CONFIG = {
+  MAX_BYTES: 4096,
+  MAX_CLIENTS: 400,
+  MAX_CACHE_SIZE: 200 * (1 << 20), // 200 MB
+  MAX_ELEMENT_SIZE: 10 * (1 << 20), // 10 MB
+  DEFAULT_PORT: 8080,
+  REQUEST_TIMEOUT: 5000, // 5 seconds
+  MAX_RETRIES: 3
+};
 
-// Custom LinkedList implementation for Cache
-class CacheElement {
-  constructor(url, data, size) {
-    this.url = url;
-    this.data = data;
-    this.size = size;
-    this.lruTimeTrack = Date.now();
-    this.next = null;
+// Custom Error Class
+class ProxyError extends Error {
+  constructor(message, statusCode) {
+    super(message);
+    this.name = 'ProxyError';
+    this.statusCode = statusCode;
   }
 }
 
-class LRUCache {
-  constructor() {
-    this.head = null;
+// Cache Element
+class CacheElement {
+  constructor(data, url) {
+    this.data = data;
+    this.url = url;
+    this.timestamp = performance.now();
+    this.hits = 0;
+    this.lastAccessed = Date.now();
+    this.size = Buffer.byteLength(data) + Buffer.byteLength(url);
+  }
+
+  updateAccess() {
+    this.hits++;
+    this.lastAccessed = Date.now();
+    this.timestamp = performance.now();
+  }
+}
+
+// LRU Cache
+class LRUCache extends EventEmitter {
+  constructor(maxSize) {
+    super();
+    this.maxSize = maxSize;
     this.currentSize = 0;
+    this.cacheMap = new Map();
+
+    // Periodic cache cleanup
+    setInterval(() => this.cleanupCache(), 1800000); // 30 minutes
   }
 
   find(url) {
-    let current = this.head;
-    while (current) {
-      if (current.url === url) {
-        current.lruTimeTrack = Date.now();
-        return current;
-      }
-      current = current.next;
+    const element = this.cacheMap.get(url);
+    if (element) {
+      element.updateAccess();
+      this.emit('cacheHit', url);
+      return element;
     }
+    this.emit('cacheMiss', url);
     return null;
   }
 
-  removeOldest() {
-    if (!this.head) return;
+  add(data, url) {
+    try {
+      const size = Buffer.byteLength(data) + Buffer.byteLength(url);
 
-    let oldest = this.head;
-    let prev = null;
-    let current = this.head;
-
-    while (current.next) {
-      if (current.next.lruTimeTrack < oldest.lruTimeTrack) {
-        oldest = current.next;
-        prev = current;
+      if (size > CONFIG.MAX_ELEMENT_SIZE) {
+        this.emit('cacheError', new Error(`Content too large for cache: ${size} bytes`));
+        return false;
       }
-      current = current.next;
-    }
 
-    if (oldest === this.head) {
-      this.head = this.head.next;
-    } else {
-      prev.next = oldest.next;
-    }
+      while (this.currentSize + size > this.maxSize) {
+        this.removeOldest();
+      }
 
-    this.currentSize -= oldest.size;
-    return oldest;
+      const newElement = new CacheElement(data, url);
+      this.cacheMap.set(url, newElement);
+      this.currentSize += size;
+
+      this.emit('cacheAdd', url);
+      return true;
+    } catch (error) {
+      this.emit('cacheError', error);
+      return false;
+    }
   }
 
-  add(url, data, size) {
-    if (size > MAX_ELEMENT_SIZE) return false;
+  removeOldest() {
+    if (this.cacheMap.size === 0) return;
 
-    while (this.currentSize + size > MAX_CACHE_SIZE) {
-      this.removeOldest();
+    let oldestKey = null;
+    let oldestTime = Infinity;
+
+    for (const [key, element] of this.cacheMap.entries()) {
+      if (element.lastAccessed < oldestTime) {
+        oldestTime = element.lastAccessed;
+        oldestKey = key;
+      }
     }
 
-    const newElement = new CacheElement(url, data, size);
-    newElement.next = this.head;
-    this.head = newElement;
-    this.currentSize += size;
-    return true;
+    if (oldestKey) {
+      const element = this.cacheMap.get(oldestKey);
+      this.currentSize -= element.size;
+      this.cacheMap.delete(oldestKey);
+      this.emit('cacheRemove', oldestKey);
+    }
+  }
+
+  cleanupCache() {
+    const now = Date.now();
+    const expiryTime = 3600000; // 1 hour
+
+    for (const [key, element] of this.cacheMap.entries()) {
+      if (now - element.lastAccessed > expiryTime) {
+        this.currentSize -= element.size;
+        this.cacheMap.delete(key);
+        this.emit('cacheExpire', key);
+      }
+    }
   }
 }
 
-// Semaphore implementation
+// Semaphore
 class Semaphore {
   constructor(max) {
     this.max = max;
@@ -85,14 +133,25 @@ class Semaphore {
     this.queue = [];
   }
 
-  async acquire() {
+  async acquire(timeout = CONFIG.REQUEST_TIMEOUT) {
     if (this.count < this.max) {
       this.count++;
-      return Promise.resolve();
+      return true;
     }
 
-    return new Promise((resolve) => {
-      this.queue.push(resolve);
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        const index = this.queue.indexOf(resolve);
+        if (index > -1) {
+          this.queue.splice(index, 1);
+        }
+        reject(new ProxyError('Connection limit reached', 503));
+      }, timeout);
+
+      this.queue.push(() => {
+        clearTimeout(timeoutId);
+        resolve(true);
+      });
     });
   }
 
@@ -106,303 +165,208 @@ class Semaphore {
   }
 }
 
-// Mutex implementation
-class Mutex {
-  constructor() {
-    this.locked = false;
-    this.queue = [];
+// Request Handler
+class RequestHandler {
+  constructor(request, response) {
+    this.request = request;
+    this.response = response;
+    this.retries = 0;
   }
 
-  async lock() {
-    if (!this.locked) {
-      this.locked = true;
-      return Promise.resolve();
-    }
+  async handleRequest() {
+    const parsedUrl = url.parse(this.request.url);
 
-    return new Promise((resolve) => {
-      this.queue.push(resolve);
-    });
-  }
-
-  unlock() {
-    if (this.queue.length > 0) {
-      const next = this.queue.shift();
-      next();
-    } else {
-      this.locked = false;
-    }
-  }
-}
-
-// Initialize global objects
-const cache = new LRUCache();
-const semaphore = new Semaphore(MAX_CLIENTS);
-const cacheMutex = new Mutex();
-
-function sendErrorResponse(res, statusCode, isTcp = false) {
-  const currentTime = new Date().toUTCString();
-  const messages = {
-    400: {
-      title: "Bad Request",
-      content:
-        "<HTML><HEAD><TITLE>400 Bad Request</TITLE></HEAD>\n<BODY><H1>400 Bad Request</H1>\n</BODY></HTML>",
-    },
-    403: {
-      title: "Forbidden",
-      content:
-        "<HTML><HEAD><TITLE>403 Forbidden</TITLE></HEAD>\n<BODY><H1>403 Forbidden</H1><br>Permission Denied\n</BODY></HTML>",
-    },
-    404: {
-      title: "Not Found",
-      content:
-        "<HTML><HEAD><TITLE>404 Not Found</TITLE></HEAD>\n<BODY><H1>404 Not Found</H1>\n</BODY></HTML>",
-    },
-    500: {
-      title: "Internal Server Error",
-      content:
-        "<HTML><HEAD><TITLE>500 Internal Server Error</TITLE></HEAD>\n<BODY><H1>500 Internal Server Error</H1>\n</BODY></HTML>",
-    },
-    501: {
-      title: "Not Implemented",
-      content:
-        "<HTML><HEAD><TITLE>501 Not Implemented</TITLE></HEAD>\n<BODY><H1>501 Not Implemented</H1>\n</BODY></HTML>",
-    },
-    505: {
-      title: "HTTP Version Not Supported",
-      content:
-        "<HTML><HEAD><TITLE>505 HTTP Version Not Supported</TITLE></HEAD>\n<BODY><H1>505 HTTP Version Not Supported</H1>\n</BODY></HTML>",
-    },
-  };
-
-  const message = messages[statusCode];
-  const headers = {
-    "Content-Type": "text/html",
-    Date: currentTime,
-    Server: "NodeProxy/1.0",
-    Connection: "close",
-  };
-
-  if (isTcp) {
-    res.end(`${statusCode} ${message.title}\r\n`);
-  } else {
-    res.writeHead(statusCode, headers);
-    res.end(message.content);
-  }
-
-  console.log(`${statusCode} ${message.title}`);
-}
-
-function checkHTTPVersion(version) {
-  return version === "1.0" || version === "1.1";
-}
-
-function sanitizeUrl(requestUrl) {
-  // Check if the URL has multiple protocol parts
-  if (
-    requestUrl.startsWith("http://http://") ||
-    requestUrl.startsWith("https://https://")
-  ) {
-    // Fix the URL to have only one protocol
-    requestUrl = requestUrl.replace(/^(http:\/\/|https:\/\/)+/, "$1");
-  }
-  return requestUrl;
-}
-
-async function handleRequest(req, res) {
-  try {
-    await semaphore.acquire();
-
-    // Log the incoming URL request
-    console.log(`Received HTTP request for: ${req.url}`);
-
-    // Sanitize URL before processing
-    const sanitizedUrl = sanitizeUrl(req.url);
-    const requestUrl = url.parse(sanitizedUrl);
-
-    let totalSize = 0;
-    req.on("data", (chunk) => {
-      totalSize += chunk.length;
-      if (totalSize > MAX_BYTES) {
-        console.log("Request Entity Too Large", totalSize);
-        sendErrorResponse(res, 400);
-        req.destroy();
-        return;
-      }
-    });
-
-    if (req.method !== "GET") {
-      console.log("Method Not Implemented", req.method);
-      sendErrorResponse(res, 501);
-      return;
-    }
-
-    if (!checkHTTPVersion(req.httpVersion)) {
-      console.log("HTTP Version Not Supported", req.httpVersion);
-      sendErrorResponse(res, 505);
-      return;
-    }
-
-    // Check if the URL is valid
-    if (!requestUrl.hostname || !requestUrl.protocol) {
-      console.log("Invalid URL format");
-      sendErrorResponse(res, 400); // Bad Request for invalid URL
-      return;
-    }
-
-    // Check cache
-    await cacheMutex.lock();
-    const cachedResponse = cache.find(req.url);
-    cacheMutex.unlock();
-
-    if (cachedResponse) {
-      console.log("Cache hit for:", req.url);
-      res.writeHead(200, {
-        "Content-Type": "text/html",
-        Connection: "close",
-      });
-      res.end(cachedResponse.data);
-      return;
-    }
-
-    // Forward request to remote server
-    const options = {
-      hostname: requestUrl.hostname,
-      port: requestUrl.port || 80,
-      path: requestUrl.path,
-      method: "GET",
-      headers: {
-        ...req.headers,
-        Connection: "close",
-      },
-    };
-
-    const proxyRequest = http.request(options, async (proxyResponse) => {
-      let responseData = Buffer.from("");
-
-      proxyResponse.on("data", (chunk) => {
-        responseData = Buffer.concat([responseData, chunk]);
-      });
-
-      proxyResponse.on("end", async () => {
-        // Cache the response
-        await cacheMutex.lock();
-        cache.add(req.url, responseData, responseData.length);
-        cacheMutex.unlock();
-
-        res.writeHead(proxyResponse.statusCode, proxyResponse.headers);
-        res.end(responseData);
-      });
-    });
-
-    proxyRequest.on("error", (err) => {
-      console.error("Proxy Request Error:", err);
-      sendErrorResponse(res, 500);
-    });
-
-    proxyRequest.end();
-  } catch (error) {
-    console.error("Request Handler Error:", error);
-    sendErrorResponse(res, 500);
-  } finally {
-    semaphore.release();
-  }
-}
-
-// HTTP Server
-const server = http.createServer(async (req, res) => {
-  await handleRequest(req, res);
-});
-
-const PORT = process.argv[2] || 8080;
-server.listen(PORT, () => {
-  console.log(`HTTP proxy server running on port ${PORT}`);
-});
-
-// TCP Server
-const tcpServer = net.createServer((socket) => {
-  console.log("TCP connection established");
-
-  let buffer = Buffer.alloc(0);
-
-  socket.on("data", (data) => {
-    buffer = Buffer.concat([buffer, data]);
-
-    if (buffer.length > MAX_BYTES) {
-      socket.end("413 Request Entity Too Large\r\n");
-      socket.destroy();
-      return;
-    }
-
-    if (buffer.includes("\r\n\r\n")) {
-      const request = buffer.toString();
-      const [requestLine] = request.split("\r\n");
-      const [method, path, httpVersion] = requestLine.split(" ");
-
-      if (
-        !method ||
-        !path ||
-        !httpVersion ||
-        !httpVersion.startsWith("HTTP/")
-      ) {
-        sendErrorResponse(socket, 400, true);
-        socket.destroy();
-        return;
-      }
-
-      // Log the request
-      console.log(`Received TCP request for: ${path}`);
-
-      // Forward the complete request to the HTTP server
+    try {
       const options = {
-        hostname: "localhost",
-        port: PORT,
-        path: path,
-        method: method,
-        headers: {
-          Connection: "close",
-        },
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || 80,
+        path: parsedUrl.path,
+        method: this.request.method,
+        headers: { ...this.request.headers }
       };
 
-      const proxyReq = http.request(options, (proxyRes) => {
-        socket.write(
-          `HTTP/1.1 ${proxyRes.statusCode} ${proxyRes.statusMessage}\r\n`
-        );
-        Object.keys(proxyRes.headers).forEach((key) => {
-          socket.write(`${key}: ${proxyRes.headers[key]}\r\n`);
-        });
-        socket.write("\r\n");
-
-        proxyRes.pipe(socket);
-      });
-
-      proxyReq.on("error", (err) => {
-        console.error("TCP Proxy Error:", err);
-        socket.end("500 Internal Server Error\r\n");
-        socket.destroy();
-      });
-
-      proxyReq.end(buffer);
-      buffer = Buffer.alloc(0);
+      return await this.makeRequest(options);
+    } catch (error) {
+      throw new ProxyError(error.message, 502);
     }
-  });
+  }
 
-  socket.on("error", (err) => {
-    console.error("Socket Error:", err);
-    socket.destroy();
-  });
-});
+  async makeRequest(options, retryCount = 0) {
+    return new Promise((resolve, reject) => {
+      const proxyReq = http.request(options, (proxyRes) => {
+        let responseData = Buffer.from('');
+        let totalSize = 0;
 
-// Start TCP server
-const TCP_PORT = Number(PORT) + 1;
-tcpServer.listen(TCP_PORT, () => {
-  console.log(`TCP server running on port ${TCP_PORT}`);
-});
+        proxyRes.setTimeout(CONFIG.REQUEST_TIMEOUT);
 
-// Handle process termination
-process.on("SIGINT", () => {
-  console.log("Shutting down servers...");
-  server.close();
-  tcpServer.close(() => {
-    process.exit(0);
-  });
-});
+        proxyRes.on('data', (chunk) => {
+          totalSize += chunk.length;
+          if (totalSize > CONFIG.MAX_BYTES) {
+            proxyReq.destroy();
+            reject(new ProxyError('Response too large', 413));
+            return;
+          }
+          responseData = Buffer.concat([responseData, chunk]);
+        });
+
+        proxyRes.on('timeout', () => {
+          proxyReq.destroy();
+          reject(new ProxyError('Response timeout', 504));
+        });
+
+        proxyRes.on('end', () => {
+          resolve({
+            statusCode: proxyRes.statusCode,
+            headers: proxyRes.headers,
+            data: responseData
+          });
+        });
+      });
+
+      proxyReq.setTimeout(CONFIG.REQUEST_TIMEOUT);
+
+      proxyReq.on('timeout', () => {
+        proxyReq.destroy();
+        reject(new ProxyError('Request timeout', 504));
+      });
+
+      proxyReq.on('error', (error) => {
+        if (retryCount < CONFIG.MAX_RETRIES) {
+          setTimeout(() => {
+            resolve(this.makeRequest(options, retryCount + 1));
+          }, 1000 * (retryCount + 1));
+        } else {
+          reject(error);
+        }
+      });
+
+      proxyReq.end();
+    });
+  }
+}
+
+// Proxy Server
+class ProxyServer {
+  constructor(port = CONFIG.DEFAULT_PORT) {
+    this.port = port;
+    this.cache = new LRUCache(CONFIG.MAX_CACHE_SIZE);
+    this.semaphore = new Semaphore(CONFIG.MAX_CLIENTS);
+    this.setupCacheEvents();
+  }
+
+  setupCacheEvents() {
+    this.cache.on('cacheHit', (url) => console.log(`Cache hit: ${url}`));
+    this.cache.on('cacheMiss', (url) => console.log(`Cache miss: ${url}`));
+    this.cache.on('cacheError', (error) => console.error(`Cache error: ${error.message}`));
+  }
+
+  async handleRequest(req, res) {
+    try {
+      await this.semaphore.acquire();
+
+      const cacheKey = `${req.method} ${req.url}`;
+      const cachedResponse = this.cache.find(cacheKey);
+
+      if (cachedResponse) {
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+        res.end(cachedResponse.data);
+        return;
+      }
+
+      const handler = new RequestHandler(req, res);
+      const response = await handler.handleRequest();
+
+      if (response.statusCode === 200) {
+        this.cache.add(response.data, cacheKey);
+      }
+
+      res.writeHead(response.statusCode, response.headers);
+      res.end(response.data);
+
+    } catch (error) {
+      const statusCode = error.statusCode || 500;
+      res.writeHead(statusCode, { 'Content-Type': 'text/plain' });
+      res.end(`Error: ${error.message}`);
+    } finally {
+      this.semaphore.release();
+    }
+  }
+
+  handleHttpsTunnel(clientSocket, targetUrl) {
+    const [host, port = '443'] = targetUrl.split(':');
+
+    const serverSocket = net.connect(parseInt(port), host, () => {
+      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      serverSocket.pipe(clientSocket);
+      clientSocket.pipe(serverSocket);
+    });
+
+    serverSocket.on('error', () => clientSocket.end());
+    clientSocket.on('error', () => serverSocket.end());
+
+    clientSocket.setTimeout(CONFIG.REQUEST_TIMEOUT);
+    serverSocket.setTimeout(CONFIG.REQUEST_TIMEOUT);
+
+    clientSocket.on('timeout', () => {
+      clientSocket.destroy();
+      serverSocket.destroy();
+    });
+
+    serverSocket.on('timeout', () => {
+      clientSocket.destroy();
+      serverSocket.destroy();
+    });
+  }
+
+  start() {
+    // HTTP Server
+    const httpServer = http.createServer((req, res) => {
+      this.handleRequest(req, res);
+    });
+
+    // TCP Server for HTTPS tunneling
+    const tcpServer = net.createServer((clientSocket) => {
+      clientSocket.once('data', (data) => {
+        const firstLine = data.toString().split('\r\n')[0];
+        const [method, url] = firstLine.split(' ');
+
+        if (method === 'CONNECT') {
+          this.handleHttpsTunnel(clientSocket, url);
+        } else {
+          clientSocket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+        }
+      });
+    });
+
+    // Start servers
+    httpServer.listen(this.port, () => {
+      console.log(`HTTP proxy server listening on port ${this.port}`);
+      console.log(`Cache size: ${CONFIG.MAX_CACHE_SIZE / (1024 * 1024)}MB`);
+    });
+
+    tcpServer.listen(this.port + 1, () => {
+      console.log(`HTTPS tunnel listening on port ${this.port + 1}`);
+    });
+
+    // Error handling
+    httpServer.on('error', (error) => {
+      console.error('HTTP Server error:', error);
+    });
+
+    tcpServer.on('error', (error) => {
+      console.error('TCP Server error:', error);
+    });
+
+    // Graceful shutdown
+    process.on('SIGTERM', () => {
+      console.log('Shutting down servers...');
+      httpServer.close();
+      tcpServer.close();
+      process.exit(0);
+    });
+  }
+}
+
+// Start the server
+const server = new ProxyServer(process.env.PORT || CONFIG.DEFAULT_PORT);
+server.start();

@@ -368,5 +368,5 @@ class ProxyServer {
 }
 
 // Start the server
-const server = new ProxyServer(process.env.PORT || CONFIG.DEFAULT_PORT);
+const server = new ProxyServer(CONFIG.DEFAULT_PORT);
 server.start();
